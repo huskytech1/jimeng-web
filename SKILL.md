@@ -148,5 +148,5 @@ With `--json` flag:
 
 ## Base Directory
 
-Base directory for this skill: file:///Users/huskytech/.claude/skills/jimeng-web
+Base directory for this skill: `~/.claude/skills/jimeng-web`
 Relative paths in this skill (e.g., scripts/) are relative to this base directory.
