@@ -1,0 +1,13 @@
+{
+  "name": "jimeng-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "bun run main.ts",
+    "dev": "bun run --watch main.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}
