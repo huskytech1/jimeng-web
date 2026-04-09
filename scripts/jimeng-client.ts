@@ -5,12 +5,13 @@ import {
   CdpConnection, 
   sleep,
 } from './vendor/baoyu-chrome-cdp/src/index.js';
-import type { 
+import type {
   GenerateOptions, 
   GenerateResult, 
   GeneratedImage, 
   JimengConfig,
-  ImageRatio 
+  ImageRatio,
+  BottomRecordSignature,
 } from './types.ts';
 import { JIMENG_URL } from './types.ts';
 
@@ -158,6 +159,41 @@ export class JimengClient {
       })()
     `);
     await sleep(400);
+  }
+
+  async getBottomRecordSignature(): Promise<BottomRecordSignature> {
+    const result = await this.evaluate(`
+      JSON.stringify((function() {
+        const cards = Array.from(document.querySelectorAll('div[class*="image-record"]')).filter((el) => {
+          if (el.parentElement?.closest('div[class*="image-record"]')) return false;
+          const imgs = Array.from(el.querySelectorAll('img[src*="byteimg"]')).filter((img) => !!img.src && img.src.startsWith('http'));
+          return imgs.length >= 1 && imgs.length <= 8;
+        }).sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+        const last = cards[cards.length - 1];
+        if (!last) return { text: '', imageUrls: [], imageCount: 0, top: -1, buttonText: [], isEmpty: true };
+        const text = (last.textContent || '').replace(/\s+/g, ' ').trim();
+        const imageUrls = Array.from(last.querySelectorAll('img[src*="byteimg"]'))
+          .map((img) => img.src)
+          .filter((src) => !!src && src.startsWith('http'));
+        const buttonText = Array.from(last.querySelectorAll('button'))
+          .map((btn) => (btn.textContent || '').replace(/\s+/g, ' ').trim())
+          .filter(Boolean)
+          .slice(0, 8);
+        return {
+          text,
+          imageUrls,
+          imageCount: imageUrls.length,
+          top: Math.round(last.getBoundingClientRect().top),
+          buttonText,
+          isEmpty: false,
+        };
+      })())
+    `);
+    try {
+      return JSON.parse(result || '{"text":"","imageUrls":[],"imageCount":0,"top":-1,"buttonText":[],"isEmpty":true}');
+    } catch {
+      return { text: '', imageUrls: [], imageCount: 0, top: -1, buttonText: [], isEmpty: true };
+    }
   }
 
   async switchToImageMode(): Promise<void> {
@@ -583,11 +619,13 @@ export class JimengClient {
     throw new Error('Generation timeout - no images found after ' + Math.round(timeoutMs/1000) + ' seconds');
   }
 
-  async waitForNewImages(existingRecordCount: number, prompt?: string, timeoutMs = 120000): Promise<void> {
+  async waitForNewImages(existingRecordCount: number, beforeBottomRecord: BottomRecordSignature, prompt?: string, timeoutMs = 120000): Promise<void> {
     this.log(`Waiting for new images (existing records: ${existingRecordCount})...`);
     const start = Date.now();
     const promptHead = (prompt || '').slice(0, 28);
     const promptTail = (prompt || '').slice(-28);
+    const beforeText = (beforeBottomRecord?.text || '').slice(0, 300);
+    const beforeImageUrls = beforeBottomRecord?.imageUrls || [];
     let refreshedOnce = false;
     
     // 初始等待让生成开始
@@ -607,6 +645,12 @@ export class JimengClient {
           const existingRecordCount = ${existingRecordCount};
           const promptHead = ${JSON.stringify(promptHead)};
           const promptTail = ${JSON.stringify(promptTail)};
+          const beforeText = ${JSON.stringify(beforeText)};
+          const beforeImageUrls = ${JSON.stringify(beforeImageUrls)};
+          const beforeImageCount = ${beforeBottomRecord.imageCount || 0};
+          const beforeTop = ${beforeBottomRecord.top ?? -1};
+          const beforeButtonText = ${JSON.stringify(beforeBottomRecord.buttonText || [])};
+          const beforeIsEmpty = ${beforeBottomRecord.isEmpty ? 'true' : 'false'};
           const getRecordCards = () => Array.from(document.querySelectorAll('div[class*="image-record"]')).filter((el) => {
             if (el.parentElement?.closest('div[class*="image-record"]')) return false;
             const imgs = Array.from(el.querySelectorAll('img[src*="byteimg"]')).filter((img) => !!img.src && img.src.startsWith('http'));
@@ -621,12 +665,45 @@ export class JimengClient {
             if (promptTail && promptTail !== promptHead && !text.includes(promptTail)) return false;
             return true;
           };
+          const sameImages = (a, b) => {
+            if (a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) {
+              if (a[i] !== b[i]) return false;
+            }
+            return true;
+          };
+          const cardSignature = (el) => ({
+            text: (el.textContent || '').replace(/\s+/g, ' ').trim(),
+            imageUrls: Array.from(el.querySelectorAll('img[src*="byteimg"]')).map((img) => img.src).filter((src) => !!src && src.startsWith('http')),
+          });
+          const sameTextArray = (a, b) => {
+            if (a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i++) {
+              if (a[i] !== b[i]) return false;
+            }
+            return true;
+          };
+          const isNewComparedToBefore = (el) => {
+            const sig = cardSignature(el);
+            const buttonText = Array.from(el.querySelectorAll('button'))
+              .map((btn) => (btn.textContent || '').replace(/\s+/g, ' ').trim())
+              .filter(Boolean)
+              .slice(0, 8);
+            const top = Math.round(el.getBoundingClientRect().top);
+            if (beforeIsEmpty) return sig.imageUrls.length > 0;
+            return sig.text !== beforeText
+              || !sameImages(sig.imageUrls, beforeImageUrls)
+              || sig.imageUrls.length !== beforeImageCount
+              || !sameTextArray(buttonText, beforeButtonText)
+              || top !== beforeTop;
+          };
           const findTaskContainer = () => {
             const records = getRecordCards();
-            const newRecords = records.slice(existingRecordCount);
-            const promptMatched = newRecords.filter((el) => textMatchesPrompt((el.textContent || '').trim()));
+            const candidateRecords = records.slice(Math.max(0, existingRecordCount - 1));
+            const promptMatched = candidateRecords.filter((el) => textMatchesPrompt((el.textContent || '').trim()) && isNewComparedToBefore(el));
             if (promptMatched.length > 0) return promptMatched[promptMatched.length - 1];
-            if (newRecords.length > 0) return newRecords[newRecords.length - 1];
+            const changedBottom = candidateRecords.filter((el) => isNewComparedToBefore(el));
+            if (changedBottom.length > 0) return changedBottom[changedBottom.length - 1];
             return null;
           };
           // 检查是否有加载/生成中状态
@@ -683,20 +760,21 @@ export class JimengClient {
             taskImageCount: taskImages.length,
             taskLoading,
             totalRecordCount,
+            bottomChanged: !!matchedContainer,
           };
         })()
       `);
 
       const newCount = Math.max(0, status?.newCount || 0);
 
-      this.log(`Check ${checkCount}: total=${status?.totalCount}, records=${status?.totalRecordCount}, new=${newCount}, taskFound=${status?.taskFound}, taskImgs=${status?.taskImageCount}, loading=${status?.hasLoading}, generating=${status?.isGenerating}`);
+      this.log(`Check ${checkCount}: total=${status?.totalCount}, records=${status?.totalRecordCount}, new=${newCount}, bottomChanged=${status?.bottomChanged}, taskFound=${status?.taskFound}, taskImgs=${status?.taskImageCount}, loading=${status?.hasLoading}, generating=${status?.isGenerating}`);
       
       // 检查是否有错误
       if (status?.hasError) {
         throw new Error('Generation failed - error detected on page');
       }
 
-      if (!refreshedOnce && checkCount >= 25 && generationStarted && newCount === 0 && status?.hasLoading) {
+      if (!refreshedOnce && checkCount >= 6 && generationStarted && !status?.bottomChanged && status?.hasLoading) {
         this.log('No new images yet; reloading page to sync finished results...');
         await this.cdp!.send('Page.reload', { ignoreCache: false }, { sessionId: this.sessionId! });
         await sleep(4000);
@@ -714,7 +792,7 @@ export class JimengClient {
       if (newCount > lastNewCount) {
         lastNewCount = newCount;
         stableCount = 0;
-        await sleep(1500);
+        await sleep(5000);
         continue;
       }
 
@@ -753,7 +831,7 @@ export class JimengClient {
         return;
       }
       
-      await sleep(1200);
+      await sleep(5000);
     }
     
     if (lastNewCount > 0) {
@@ -800,16 +878,24 @@ export class JimengClient {
     return images || [];
   }
 
-  async getNewGeneratedImages(existingRecordCount: number, prompt?: string): Promise<GeneratedImage[]> {
+  async getNewGeneratedImages(existingRecordCount: number, beforeBottomRecord: BottomRecordSignature, prompt?: string): Promise<GeneratedImage[]> {
     this.log(`Getting new generated images (existing records: ${existingRecordCount})...`);
     const promptHead = (prompt || '').slice(0, 28);
     const promptTail = (prompt || '').slice(-28);
+    const beforeText = (beforeBottomRecord?.text || '').slice(0, 300);
+    const beforeImageUrls = beforeBottomRecord?.imageUrls || [];
     
     const images = await this.evaluate(`
       (function() {
         const existingRecordCount = ${existingRecordCount};
         const promptHead = ${JSON.stringify(promptHead)};
         const promptTail = ${JSON.stringify(promptTail)};
+        const beforeText = ${JSON.stringify(beforeText)};
+        const beforeImageUrls = ${JSON.stringify(beforeImageUrls)};
+        const beforeImageCount = ${beforeBottomRecord.imageCount || 0};
+        const beforeTop = ${beforeBottomRecord.top ?? -1};
+        const beforeButtonText = ${JSON.stringify(beforeBottomRecord.buttonText || [])};
+        const beforeIsEmpty = ${beforeBottomRecord.isEmpty ? 'true' : 'false'};
           const getRecordCards = () => Array.from(document.querySelectorAll('div[class*="image-record"]')).filter((el) => {
             if (el.parentElement?.closest('div[class*="image-record"]')) return false;
             const imgs = Array.from(el.querySelectorAll('img[src*="byteimg"]')).filter((img) => !!img.src && img.src.startsWith('http'));
@@ -824,12 +910,45 @@ export class JimengClient {
           if (promptTail && promptTail !== promptHead && !text.includes(promptTail)) return false;
           return true;
         };
+        const sameImages = (a, b) => {
+          if (a.length !== b.length) return false;
+          for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) return false;
+          }
+          return true;
+        };
+        const cardSignature = (el) => ({
+          text: (el.textContent || '').replace(/\s+/g, ' ').trim(),
+          imageUrls: Array.from(el.querySelectorAll('img[src*="byteimg"]')).map((img) => img.src).filter((src) => !!src && src.startsWith('http')),
+        });
+        const sameTextArray = (a, b) => {
+          if (a.length !== b.length) return false;
+          for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) return false;
+          }
+          return true;
+        };
+        const isNewComparedToBefore = (el) => {
+          const sig = cardSignature(el);
+          const buttonText = Array.from(el.querySelectorAll('button'))
+            .map((btn) => (btn.textContent || '').replace(/\s+/g, ' ').trim())
+            .filter(Boolean)
+            .slice(0, 8);
+          const top = Math.round(el.getBoundingClientRect().top);
+          if (beforeIsEmpty) return sig.imageUrls.length > 0;
+          return sig.text !== beforeText
+            || !sameImages(sig.imageUrls, beforeImageUrls)
+            || sig.imageUrls.length !== beforeImageCount
+            || !sameTextArray(buttonText, beforeButtonText)
+            || top !== beforeTop;
+        };
         const findTaskContainer = () => {
           const records = getRecordCards();
-          const newRecords = records.slice(existingRecordCount);
-          const promptMatched = newRecords.filter((el) => textMatchesPrompt((el.textContent || '').trim()));
+          const candidateRecords = records.slice(Math.max(0, existingRecordCount - 1));
+          const promptMatched = candidateRecords.filter((el) => textMatchesPrompt((el.textContent || '').trim()) && isNewComparedToBefore(el));
           if (promptMatched.length > 0) return promptMatched[promptMatched.length - 1];
-          if (newRecords.length > 0) return newRecords[newRecords.length - 1];
+          const changedBottom = candidateRecords.filter((el) => isNewComparedToBefore(el));
+          if (changedBottom.length > 0) return changedBottom[changedBottom.length - 1];
           return null;
         };
 
@@ -1180,6 +1299,9 @@ export class JimengClient {
         throw new Error('Jimeng page not found. Please open jimeng.jianying.com in Chrome first.');
       }
 
+      const beforeBottomRecord = await this.getBottomRecordSignature();
+      this.log(`Initial bottom record baseline: ${JSON.stringify({ text: beforeBottomRecord.text.slice(0, 80), imageCount: beforeBottomRecord.imageCount, top: beforeBottomRecord.top, isEmpty: beforeBottomRecord.isEmpty })}`);
+
       // 切换到图片模式
       await this.switchToImageMode();
       
@@ -1215,10 +1337,10 @@ export class JimengClient {
       await this.clickGenerate();
 
       // 等待新图生成完成
-      await this.waitForNewImages(parsedExistingRecordCount || 0, options.prompt);
+      await this.waitForNewImages(parsedExistingRecordCount || 0, beforeBottomRecord, options.prompt);
 
       // 获取本轮新生成图片
-      const images = await this.getNewGeneratedImages(parsedExistingRecordCount || 0, options.prompt);
+      const images = await this.getNewGeneratedImages(parsedExistingRecordCount || 0, beforeBottomRecord, options.prompt);
       
       if (images.length === 0) {
         return {

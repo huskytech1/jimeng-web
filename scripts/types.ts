@@ -40,13 +40,13 @@ export interface GenerateResult {
   duration?: number;
 }
 
-export interface CliArgs {
-  prompt: string | null;
-  outputPath: string | null;
-  ratio: ImageRatio;
-  json: boolean;
-  help: boolean;
-  quiet: boolean;
+export interface BottomRecordSignature {
+  text: string;
+  imageUrls: string[];
+  imageCount: number;
+  top: number;
+  buttonText: string[];
+  isEmpty: boolean;
 }
 
 export const JIMENG_URL = 'https://jimeng.jianying.com/ai-tool/image/generate';
