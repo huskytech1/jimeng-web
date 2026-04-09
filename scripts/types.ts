@@ -44,14 +44,9 @@ export interface CliArgs {
   prompt: string | null;
   outputPath: string | null;
   ratio: ImageRatio;
-  style: ImageStyle | null;
-  negativePrompt: string | null;
   json: boolean;
-  login: boolean;
-  cookiePath: string | null;
-  profileDir: string | null;
-  headless: boolean;
   help: boolean;
+  quiet: boolean;
 }
 
 export const JIMENG_URL = 'https://jimeng.jianying.com/ai-tool/image/generate';

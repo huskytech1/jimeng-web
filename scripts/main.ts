@@ -1,7 +1,7 @@
 import path from 'node:path';
 import process from 'node:process';
-import { JimengClient } from './jimeng-client.js';
-import type { CliArgs, ImageRatio, ImageStyle } from './types.js';
+import { JimengClient } from './jimeng-client.ts';
+import type { CliArgs, ImageRatio } from './types.ts';
 
 function formatScriptCommand(fallback: string): string {
   const raw = process.argv[1];
@@ -27,12 +27,14 @@ Options:
   -p, --prompt <text>       Prompt text (required for generation)
   -o, --output <path>       Output image path
   -r, --ratio <ratio>       Image ratio: 1:1, 16:9, 9:16, 4:3, 3:4
+  -q, --quiet               Silent mode (no progress logs)
   --json                    Output as JSON
   -h, --help                Show help
 
 Examples:
   ${cmd} "一只可爱的猫咪在花园里玩耍"
-  ${cmd} --prompt "赛博朋克城市夜景" --ratio 16:9`);
+  ${cmd} --prompt "赛博朋克城市夜景" --ratio 16:9
+  ${cmd} "少女写真" --ratio 16:9 --quiet`);
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -40,14 +42,9 @@ function parseArgs(argv: string[]): CliArgs {
     prompt: null,
     outputPath: null,
     ratio: '1:1',
-    style: null,
-    negativePrompt: null,
     json: false,
-    login: false,
-    cookiePath: null,
-    profileDir: null,
-    headless: false,
     help: false,
+    quiet: false,
   };
 
   const positional: string[] = [];
@@ -62,6 +59,11 @@ function parseArgs(argv: string[]): CliArgs {
 
     if (a === '--json') {
       out.json = true;
+      continue;
+    }
+
+    if (a === '--quiet' || a === '-q') {
+      out.quiet = true;
       continue;
     }
 
@@ -117,7 +119,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  const client = new JimengClient({}, !args.json);
+  // verbose = !quiet && !json (静默模式下不输出日志，JSON模式下也不输出)
+  const client = new JimengClient({}, !args.quiet && !args.json);
 
   const result = await client.generate({
     prompt: args.prompt,
