@@ -196,6 +196,222 @@ export class JimengClient {
     }
   }
 
+  async installApiProbe(): Promise<void> {
+    await this.evaluate(`
+      (function() {
+        window.__jimengApiProbe = [];
+        const push = (item) => { try { window.__jimengApiProbe.push({ ts: Date.now(), ...item }); } catch {} };
+        if (window.__jimengApiProbeInstalled) return 'ok';
+        window.__jimengApiProbeInstalled = true;
+
+        const xhrOpen = XMLHttpRequest.prototype.open;
+        const xhrSend = XMLHttpRequest.prototype.send;
+        const xhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+        XMLHttpRequest.prototype.open = function(method, url) {
+          this.__probeMethod = method;
+          this.__probeUrl = url;
+          this.__probeHeaders = {};
+          this.addEventListener('load', function() {
+            push({
+              kind: 'xhr',
+              url: this.__probeUrl,
+              method: this.__probeMethod || 'GET',
+              headers: this.__probeHeaders || {},
+              status: this.status,
+              responseText: typeof this.responseText === 'string' ? this.responseText : '',
+              body: this.__probeBody || '',
+            });
+          });
+          return xhrOpen.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+          this.__probeHeaders[name] = value;
+          return xhrSetHeader.apply(this, arguments);
+        };
+
+        XMLHttpRequest.prototype.send = function(body) {
+          this.__probeBody = typeof body === 'string' ? body : String(body || '');
+          return xhrSend.apply(this, arguments);
+        };
+
+        return 'ok';
+      })()
+    `);
+  }
+
+  async getLatestApiProbeEvent(urlPart: string): Promise<any | null> {
+    const raw = await this.evaluate(`
+      JSON.stringify((window.__jimengApiProbe || []).filter(x => String(x.url || '').includes(${JSON.stringify(urlPart)})).slice(-1)[0] || null)
+    `);
+    try {
+      return JSON.parse(String(raw || 'null'));
+    } catch {
+      return null;
+    }
+  }
+
+  private async validateSavedImageRatio(filePath: string, ratio?: ImageRatio): Promise<boolean> {
+    if (!ratio) return true;
+    const data = await fs.promises.readFile(filePath);
+    const header = data.subarray(0, 64).toString('ascii');
+    let width = 0;
+    let height = 0;
+
+    if (header.startsWith('\x89PNG') || data[0] === 0x89) {
+      width = data.readUInt32BE(16);
+      height = data.readUInt32BE(20);
+    } else if (header.includes('WEBP')) {
+      const text = data.toString('latin1');
+      const vp8x = text.indexOf('VP8X');
+      if (vp8x >= 0) {
+        width = 1 + data.readUIntLE(vp8x + 8, 3);
+        height = 1 + data.readUIntLE(vp8x + 11, 3);
+      }
+    }
+
+    if (!width || !height) return true;
+
+    const target: Record<ImageRatio, number> = {
+      '1:1': 1,
+      '16:9': 16 / 9,
+      '9:16': 9 / 16,
+      '4:3': 4 / 3,
+      '3:4': 3 / 4,
+    };
+    const actual = width / height;
+    const expected = target[ratio];
+    return Math.abs(actual - expected) / expected < 0.06;
+  }
+
+  private async generateViaApiPreferred(options: GenerateOptions, beforeBottomRecord: BottomRecordSignature, startTime: number): Promise<GenerateResult> {
+    await this.installApiProbe();
+    await this.inputPrompt(options.prompt);
+    await this.dismissTransientUi();
+    await this.clickGenerate();
+
+    let generateEvent: any = null;
+    for (let i = 0; i < 20; i++) {
+      await sleep(3000);
+      generateEvent = await this.getLatestApiProbeEvent('/mweb/v1/aigc_draft/generate');
+      if (generateEvent) break;
+    }
+    if (!generateEvent) throw new Error('API-first path could not capture generate request');
+
+    const generateData = JSON.parse(generateEvent.responseText || '{}');
+    const submitId = generateData?.data?.aigc_data?.task?.submit_id;
+    if (!submitId) throw new Error('API-first path missing submit_id');
+
+    let pollTemplate: any = null;
+    for (let i = 0; i < 20; i++) {
+      await sleep(2000);
+      pollTemplate = await this.getLatestApiProbeEvent('/mweb/v1/get_history_by_ids');
+      if (pollTemplate) break;
+    }
+    if (!pollTemplate) throw new Error('API-first path could not capture polling template');
+
+    const pollHeaders = { ...(pollTemplate.headers || {}) };
+    const pollBody = JSON.stringify({ submit_ids: [submitId] });
+    let pollResult: any = null;
+
+    for (let i = 0; i < 60; i++) {
+      const raw = await this.evaluate(`
+        (async function() {
+          const res = await fetch(${JSON.stringify(pollTemplate.url)}, {
+            method: ${JSON.stringify(pollTemplate.method || 'POST')},
+            headers: ${JSON.stringify(pollHeaders)},
+            body: ${JSON.stringify(pollBody)},
+            credentials: 'include',
+          });
+          const text = await res.text();
+          return JSON.stringify({ status: res.status, text });
+        })()
+      `);
+      pollResult = JSON.parse(String(raw || '{}'));
+      const pollData = JSON.parse(pollResult.text || '{}');
+      const dataNode = pollData?.data || {};
+      const rec = dataNode?.history_list?.[0] || dataNode?.list?.[0] || dataNode?.[submitId] || null;
+      const itemList = rec?.item_list || rec?.origin_item_list || [];
+      if (Array.isArray(itemList) && itemList.length > 0) break;
+      await sleep(3000);
+    }
+
+    const pollData = JSON.parse(pollResult?.text || '{}');
+    const dataNode = pollData?.data || {};
+    const rec = dataNode?.history_list?.[0] || dataNode?.list?.[0] || dataNode?.[submitId] || null;
+    const itemList = rec?.item_list || rec?.origin_item_list || [];
+    if (!Array.isArray(itemList) || itemList.length === 0) {
+      throw new Error('API-first path polling returned no generated items');
+    }
+
+    const directUrl = itemList
+      .map((item: any) => item?.image?.large_images?.[0]?.image_url || item?.common_attr?.cover_url_map?.['4096'] || item?.common_attr?.cover_url_map?.['2400'] || item?.common_attr?.cover_url)
+      .find(Boolean);
+    if (!directUrl) throw new Error('API-first path missing direct image URL');
+
+    const outputPath = options.outputPath ?? this.getDefaultOutputPath();
+    const fileRes = await fetch(directUrl);
+    if (!fileRes.ok) throw new Error(`API-first image download failed: ${fileRes.status}`);
+    await Bun.write(outputPath, new Uint8Array(await fileRes.arrayBuffer()));
+    const ratioOk = await this.validateSavedImageRatio(outputPath, options.ratio);
+    if (!ratioOk) {
+      throw new Error('API-first image ratio validation failed');
+    }
+
+    const images: GeneratedImage[] = itemList.map((item: any, index: number) => ({
+      url: item?.image?.large_images?.[0]?.image_url || item?.common_attr?.cover_url || directUrl,
+      index,
+      width: item?.image?.large_images?.[0]?.width || item?.common_attr?.cover_width,
+      height: item?.image?.large_images?.[0]?.height || item?.common_attr?.cover_height,
+    }));
+
+    return {
+      success: true,
+      images,
+      savedPath: outputPath,
+      duration: Date.now() - startTime,
+    };
+  }
+
+  private async generateViaWebFallback(options: GenerateOptions, beforeBottomRecord: BottomRecordSignature, startTime: number): Promise<GenerateResult> {
+    await this.inputPrompt(options.prompt);
+    await this.dismissTransientUi();
+
+    const existingRecordCount = await this.evaluate(`
+      JSON.stringify((function() {
+        return Array.from(document.querySelectorAll('div[class*="image-record"]')).filter((el) => {
+          if (el.parentElement?.closest('div[class*="image-record"]')) return false;
+          const imgs = Array.from(el.querySelectorAll('img[src*="byteimg"]')).filter((img) => !!img.src && img.src.startsWith('http'));
+          return imgs.length >= 1 && imgs.length <= 8;
+        }).length;
+      })())
+    `);
+    const parsedExistingRecordCount = Number(existingRecordCount || 0);
+    this.log(`Existing records before generation: ${parsedExistingRecordCount || 0}`);
+
+    await this.clickGenerate();
+    await this.waitForNewImages(parsedExistingRecordCount || 0, beforeBottomRecord, options.prompt);
+    const images = await this.getNewGeneratedImages(parsedExistingRecordCount || 0, beforeBottomRecord, options.prompt);
+    if (images.length === 0) {
+      return {
+        success: false,
+        images: [],
+        error: 'No images were generated',
+        duration: Date.now() - startTime,
+      };
+    }
+    const bestImage = await this.selectBestImage(images);
+    const outputPath = options.outputPath ?? this.getDefaultOutputPath();
+    const savedPath = await this.downloadImage(bestImage, outputPath);
+    return {
+      success: true,
+      images,
+      savedPath,
+      duration: Date.now() - startTime,
+    };
+  }
+
   async switchToImageMode(): Promise<void> {
     this.log('Switching to Image mode...');
 
@@ -1314,58 +1530,13 @@ export class JimengClient {
       }
 
       await this.dismissTransientUi();
-
-      // 输入提示词
-      await this.inputPrompt(options.prompt);
-
-      await this.dismissTransientUi();
-
-      // 记录生成前任务卡片数量（用于识别当前新任务）
-      const existingRecordCount = await this.evaluate(`
-        JSON.stringify((function() {
-          return Array.from(document.querySelectorAll('div[class*="image-record"]')).filter((el) => {
-            if (el.parentElement?.closest('div[class*="image-record"]')) return false;
-            const imgs = Array.from(el.querySelectorAll('img[src*="byteimg"]')).filter((img) => !!img.src && img.src.startsWith('http'));
-            return imgs.length >= 1 && imgs.length <= 8;
-          }).length;
-        })())
-      `);
-      const parsedExistingRecordCount = Number(existingRecordCount || 0);
-      this.log(`Existing records before generation: ${parsedExistingRecordCount || 0}`);
-
-      // 点击生成
-      await this.clickGenerate();
-
-      // 等待新图生成完成
-      await this.waitForNewImages(parsedExistingRecordCount || 0, beforeBottomRecord, options.prompt);
-
-      // 获取本轮新生成图片
-      const images = await this.getNewGeneratedImages(parsedExistingRecordCount || 0, beforeBottomRecord, options.prompt);
-      
-      if (images.length === 0) {
-        return {
-          success: false,
-          images: [],
-          error: 'No images were generated',
-          duration: Date.now() - startTime,
-        };
+      try {
+        this.log('Trying API-first generation flow...');
+        return await this.generateViaApiPreferred(options, beforeBottomRecord, startTime);
+      } catch (apiError) {
+        this.log(`API-first flow failed, falling back to web flow: ${apiError instanceof Error ? apiError.message : String(apiError)}`);
+        return await this.generateViaWebFallback(options, beforeBottomRecord, startTime);
       }
-
-      // 选择最佳图片
-      const bestImage = await this.selectBestImage(images);
-
-      // 确定输出路径
-      const outputPath = options.outputPath ?? this.getDefaultOutputPath();
-
-      // 下载图片
-      const savedPath = await this.downloadImage(bestImage, outputPath);
-
-      return {
-        success: true,
-        images,
-        savedPath,
-        duration: Date.now() - startTime,
-      };
     } catch (error) {
       return {
         success: false,
