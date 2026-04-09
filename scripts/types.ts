@@ -49,6 +49,23 @@ export interface BottomRecordSignature {
   isEmpty: boolean;
 }
 
+export interface ApiTemplateCache {
+  ratio: ImageRatio;
+  prompt: string;
+  submitId: string;
+  generate: {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body: string;
+  };
+  poll: {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+  };
+}
+
 export const JIMENG_URL = 'https://jimeng.jianying.com/ai-tool/image/generate';
 
 export const DEFAULT_CONFIG: JimengConfig = {

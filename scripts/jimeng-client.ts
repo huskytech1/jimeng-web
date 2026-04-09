@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { 
   CdpConnection, 
   sleep,
@@ -12,6 +13,7 @@ import type {
   JimengConfig,
   ImageRatio,
   BottomRecordSignature,
+  ApiTemplateCache,
 } from './types.ts';
 import { JIMENG_URL } from './types.ts';
 
@@ -47,6 +49,10 @@ export class JimengClient {
 
   private resolveProfileDir(): string {
     return path.join(this.resolveDataDir(), 'chrome-profile');
+  }
+
+  private resolveApiTemplatePath(ratio: ImageRatio): string {
+    return path.join(this.resolveDataDir(), `api-template-${ratio.replace(':', 'x')}.json`);
   }
 
   private log(message: string): void {
@@ -252,6 +258,37 @@ export class JimengClient {
     }
   }
 
+  private async loadApiTemplate(ratio: ImageRatio): Promise<ApiTemplateCache | null> {
+    try {
+      const raw = await fs.promises.readFile(this.resolveApiTemplatePath(ratio), 'utf8');
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+
+  private async saveApiTemplate(ratio: ImageRatio, prompt: string, generateEvent: any, pollEvent: any): Promise<void> {
+    const submitId = JSON.parse(generateEvent.responseText || '{}')?.data?.aigc_data?.task?.submit_id || '';
+    const payload: ApiTemplateCache = {
+      ratio,
+      prompt,
+      submitId,
+      generate: {
+        url: generateEvent.url,
+        method: generateEvent.method || 'POST',
+        headers: generateEvent.headers || {},
+        body: generateEvent.body || '',
+      },
+      poll: {
+        url: pollEvent.url,
+        method: pollEvent.method || 'POST',
+        headers: pollEvent.headers || {},
+      },
+    };
+    await fs.promises.mkdir(this.resolveDataDir(), { recursive: true });
+    await fs.promises.writeFile(this.resolveApiTemplatePath(ratio), JSON.stringify(payload, null, 2));
+  }
+
   private async validateSavedImageRatio(filePath: string, ratio?: ImageRatio): Promise<boolean> {
     if (!ratio) return true;
     const data = await fs.promises.readFile(filePath);
@@ -285,6 +322,93 @@ export class JimengClient {
     return Math.abs(actual - expected) / expected < 0.06;
   }
 
+  private async downloadDirectUrl(directUrl: string, outputPath: string, ratio?: ImageRatio): Promise<void> {
+    const fileRes = await fetch(directUrl);
+    if (!fileRes.ok) throw new Error(`image download failed: ${fileRes.status}`);
+    await Bun.write(outputPath, new Uint8Array(await fileRes.arrayBuffer()));
+    const ratioOk = await this.validateSavedImageRatio(outputPath, ratio);
+    if (!ratioOk) throw new Error('saved image ratio validation failed');
+  }
+
+  private async generateViaSilentApiCache(options: GenerateOptions, startTime: number): Promise<GenerateResult> {
+    if (!options.ratio) throw new Error('silent API cache path requires ratio');
+    const cache = await this.loadApiTemplate(options.ratio);
+    if (!cache) throw new Error('silent API template cache missing');
+
+    const newSubmitId = crypto.randomUUID();
+    const body = cache.generate.body
+      .split(cache.submitId).join(newSubmitId)
+      .split(cache.prompt).join(options.prompt);
+
+    const genRaw = await this.evaluate(`
+      (async function() {
+        const res = await fetch(${JSON.stringify(cache.generate.url)}, {
+          method: ${JSON.stringify(cache.generate.method)},
+          headers: ${JSON.stringify(cache.generate.headers)},
+          body: ${JSON.stringify(body)},
+          credentials: 'include',
+        });
+        const text = await res.text();
+        return JSON.stringify({ status: res.status, text });
+      })()
+    `);
+    const genResult = JSON.parse(String(genRaw || '{}'));
+    if (genResult.status !== 200) throw new Error(`silent API generate failed: ${genResult.status}`);
+    const genData = JSON.parse(genResult.text || '{}');
+    const submitId = genData?.data?.aigc_data?.task?.submit_id || newSubmitId;
+
+    let pollResult: any = null;
+    for (let i = 0; i < 60; i++) {
+      const raw = await this.evaluate(`
+        (async function() {
+          const res = await fetch(${JSON.stringify(cache.poll.url)}, {
+            method: ${JSON.stringify(cache.poll.method)},
+            headers: ${JSON.stringify(cache.poll.headers)},
+            body: JSON.stringify({ submit_ids: [${JSON.stringify(submitId)}] }),
+            credentials: 'include',
+          });
+          const text = await res.text();
+          return JSON.stringify({ status: res.status, text });
+        })()
+      `);
+      pollResult = JSON.parse(String(raw || '{}'));
+      const pollData = JSON.parse(pollResult.text || '{}');
+      const dataNode = pollData?.data || {};
+      const rec = dataNode?.history_list?.[0] || dataNode?.list?.[0] || dataNode?.[submitId] || null;
+      const itemList = rec?.item_list || rec?.origin_item_list || [];
+      if (Array.isArray(itemList) && itemList.length > 0) break;
+      await sleep(3000);
+    }
+
+    const pollData = JSON.parse(pollResult?.text || '{}');
+    const dataNode = pollData?.data || {};
+    const rec = dataNode?.history_list?.[0] || dataNode?.list?.[0] || dataNode?.[submitId] || null;
+    const itemList = rec?.item_list || rec?.origin_item_list || [];
+    if (!Array.isArray(itemList) || itemList.length === 0) throw new Error('silent API polling returned no generated items');
+
+    const directUrl = itemList
+      .map((item: any) => item?.image?.large_images?.[0]?.image_url || item?.common_attr?.cover_url_map?.['4096'] || item?.common_attr?.cover_url_map?.['2400'] || item?.common_attr?.cover_url)
+      .find(Boolean);
+    if (!directUrl) throw new Error('silent API missing direct image url');
+
+    const outputPath = options.outputPath ?? this.getDefaultOutputPath();
+    await this.downloadDirectUrl(directUrl, outputPath, options.ratio);
+
+    const images: GeneratedImage[] = itemList.map((item: any, index: number) => ({
+      url: item?.image?.large_images?.[0]?.image_url || item?.common_attr?.cover_url || directUrl,
+      index,
+      width: item?.image?.large_images?.[0]?.width || item?.common_attr?.cover_width,
+      height: item?.image?.large_images?.[0]?.height || item?.common_attr?.cover_height,
+    }));
+
+    return {
+      success: true,
+      images,
+      savedPath: outputPath,
+      duration: Date.now() - startTime,
+    };
+  }
+
   private async generateViaApiPreferred(options: GenerateOptions, beforeBottomRecord: BottomRecordSignature, startTime: number): Promise<GenerateResult> {
     await this.installApiProbe();
     await this.inputPrompt(options.prompt);
@@ -310,6 +434,9 @@ export class JimengClient {
       if (pollTemplate) break;
     }
     if (!pollTemplate) throw new Error('API-first path could not capture polling template');
+    if (options.ratio) {
+      await this.saveApiTemplate(options.ratio, options.prompt, generateEvent, pollTemplate);
+    }
 
     const pollHeaders = { ...(pollTemplate.headers || {}) };
     const pollBody = JSON.stringify({ submit_ids: [submitId] });
@@ -351,13 +478,7 @@ export class JimengClient {
     if (!directUrl) throw new Error('API-first path missing direct image URL');
 
     const outputPath = options.outputPath ?? this.getDefaultOutputPath();
-    const fileRes = await fetch(directUrl);
-    if (!fileRes.ok) throw new Error(`API-first image download failed: ${fileRes.status}`);
-    await Bun.write(outputPath, new Uint8Array(await fileRes.arrayBuffer()));
-    const ratioOk = await this.validateSavedImageRatio(outputPath, options.ratio);
-    if (!ratioOk) {
-      throw new Error('API-first image ratio validation failed');
-    }
+    await this.downloadDirectUrl(directUrl, outputPath, options.ratio);
 
     const images: GeneratedImage[] = itemList.map((item: any, index: number) => ({
       url: item?.image?.large_images?.[0]?.image_url || item?.common_attr?.cover_url || directUrl,
@@ -1517,6 +1638,13 @@ export class JimengClient {
 
       const beforeBottomRecord = await this.getBottomRecordSignature();
       this.log(`Initial bottom record baseline: ${JSON.stringify({ text: beforeBottomRecord.text.slice(0, 80), imageCount: beforeBottomRecord.imageCount, top: beforeBottomRecord.top, isEmpty: beforeBottomRecord.isEmpty })}`);
+
+      try {
+        this.log('Trying silent API cache flow...');
+        return await this.generateViaSilentApiCache(options, startTime);
+      } catch (silentError) {
+        this.log(`Silent API cache flow unavailable: ${silentError instanceof Error ? silentError.message : String(silentError)}`);
+      }
 
       // 切换到图片模式
       await this.switchToImageMode();
